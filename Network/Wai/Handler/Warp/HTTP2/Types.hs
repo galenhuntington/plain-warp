@@ -16,11 +16,6 @@ import Network.Wai.Handler.Warp.Types
 
 isHTTP2 :: Transport -> Bool
 isHTTP2 TCP = False
-isHTTP2 tls = useHTTP2
-  where
-    useHTTP2 = case tlsNegotiatedProtocol tls of
-        Nothing    -> False
-        Just proto -> "h2" `BS.isPrefixOf` proto
 
 ----------------------------------------------------------------
 

@@ -30,7 +30,7 @@ import qualified Network.HTTP.Types as H
 import qualified Network.HTTP.Types.Header as H
 import Network.Wai
 import Network.Wai.Internal
-import qualified Paths_warp
+import qualified Paths_plain_warp as Paths
 import qualified System.TimeManager as T
 
 import Network.Wai.Handler.Warp.Buffer (toBuilderBuffer)
@@ -402,7 +402,7 @@ addDate getdate rspidxhdr hdrs = case rspidxhdr ! fromEnum ResDate of
 
 -- | The version of Warp.
 warpVersion :: String
-warpVersion = showVersion Paths_warp.version
+warpVersion = showVersion Paths.version
 
 {-# INLINE addServer #-}
 addServer :: HeaderValue -> IndexedHeader -> H.ResponseHeaders -> H.ResponseHeaders

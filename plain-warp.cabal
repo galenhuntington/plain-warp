@@ -1,10 +1,10 @@
-Name:                warp
+Name:                plain-warp
 Version:             3.3.13
 Synopsis:            A fast, light-weight web server for WAI applications.
 License:             MIT
 License-file:        LICENSE
 Author:              Michael Snoyman, Kazu Yamamoto, Matt Brown
-Maintainer:          michael@snoyman.com
+-- Maintainer:          michael@snoyman.com
 Homepage:            http://github.com/yesodweb/wai
 Category:            Web, Yesod
 Build-Type:          Simple
@@ -56,7 +56,6 @@ Library
                    , vault                     >= 0.3
                    , wai                       >= 3.2      && < 3.3
                    , word8
-                   , x509
   if impl(ghc < 8)
       Build-Depends: semigroups
   if flag(network-bytestring)
@@ -96,7 +95,7 @@ Library
                      Network.Wai.Handler.Warp.Types
                      Network.Wai.Handler.Warp.Windows
                      Network.Wai.Handler.Warp.WithApplication
-                     Paths_warp
+                     Paths_plain_warp
   Ghc-Options:       -Wall
 
   if flag(warp-debug)
@@ -174,7 +173,7 @@ Test-Suite spec
                      Network.Wai.Handler.Warp.Types
                      Network.Wai.Handler.Warp.Windows
                      Network.Wai.Handler.Warp.WithApplication
-                     Paths_warp
+                     Paths_plain_warp
 
     Hs-Source-Dirs:  test, .
     Type:            exitcode-stdio-1.0
@@ -212,7 +211,6 @@ Test-Suite spec
                    , vault
                    , wai                       >= 3.2      && < 3.3
                    , word8
-                   , x509
     -- Build-Tool-Depends: hspec-discover:hspec-discover
   if impl(ghc < 8)
       Build-Depends: semigroups
@@ -248,10 +246,8 @@ Benchmark parser
                   , http-date
                   , http-types
                   , network
-                  , network
                   , time-manager
                   , unix-compat
-                  , x509
   if impl(ghc < 8)
       Build-Depends: semigroups
 

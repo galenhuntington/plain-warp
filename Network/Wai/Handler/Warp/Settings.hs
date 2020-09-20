@@ -18,7 +18,7 @@ import qualified Network.HTTP.Types as H
 import Network.HTTP2( HTTP2Error (..), ErrorCodeId (..) )
 import Network.Socket (SockAddr)
 import Network.Wai
-import qualified Paths_warp
+import qualified Paths_plain_warp as Paths
 import System.IO (stderr)
 import System.IO.Error (ioeGetErrorType)
 import System.TimeManager
@@ -166,7 +166,7 @@ defaultSettings = Settings
     , settingsFork = void . forkIOWithUnmask
     , settingsNoParsePath = False
     , settingsInstallShutdownHandler = const $ return ()
-    , settingsServerName = C8.pack $ "Warp/" ++ showVersion Paths_warp.version
+    , settingsServerName = C8.pack $ "Warp/" ++ showVersion Paths.version
     , settingsMaximumBodyFlush = Just 8192
     , settingsProxyProtocol = ProxyProtocolNone
     , settingsSlowlorisSize = 2048

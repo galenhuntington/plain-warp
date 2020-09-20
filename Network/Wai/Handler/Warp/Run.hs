@@ -528,8 +528,6 @@ serveConnection conn ii th origAddr transport settings app = do
 
     checkTLS = case transport of
         TCP -> return () -- direct
-        tls -> unless (tls12orLater tls) $ goaway conn H2.InadequateSecurity "Weak TLS"
-    tls12orLater tls = tlsMajorVersion tls == 3 && tlsMinorVersion tls >= 3
 
 -- connClose must not be called here since Run:fork calls it
 goaway :: Connection -> H2.ErrorCodeId -> ByteString -> IO ()
