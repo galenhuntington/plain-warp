@@ -1,34 +1,28 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE PackageImports #-}
-{-# LANGUAGE PatternGuards #-}
-{-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections #-}
-{-# LANGUAGE ViewPatterns #-}
 {-# OPTIONS_GHC -fno-warn-deprecations #-}
 
 module Network.Wai.Handler.Warp.Run where
 
-import "iproute" Data.IP (toHostAddress, toHostAddress6)
 import Control.Arrow (first)
-import qualified Control.Concurrent as Conc (yield)
-import Control.Exception as E
+import Control.Exception (allowInterrupt)
+import qualified Control.Exception
+import qualified UnliftIO
+import UnliftIO (toException)
 import qualified Data.ByteString as S
-import Data.Char (chr)
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.IORef (newIORef, readIORef)
 import Data.Streaming.Network (bindPortTCP)
 import Foreign.C.Error (Errno(..), eCONNABORTED)
 import GHC.IO.Exception (IOException(..), IOErrorType(..))
-import qualified Network.HTTP2 as H2
-import Network.Socket (Socket, close, accept, withSocketsDo, SockAddr(SockAddrInet, SockAddrInet6), setSocketOption, SocketOption(..))
+import Network.Socket (Socket, close, accept, withSocketsDo, SockAddr, setSocketOption, SocketOption(..))
 #if MIN_VERSION_network(3,1,1)
 import Network.Socket (gracefulClose)
 #endif
 import qualified Network.Socket.ByteString as Sock
 import Network.Wai
-import Network.Wai.Internal (ResponseReceived (ResponseReceived))
 import System.Environment (lookupEnv)
 import System.IO.Error (ioeGetErrorType)
 import qualified System.TimeManager as T
@@ -39,14 +33,11 @@ import Network.Wai.Handler.Warp.Counter
 import qualified Network.Wai.Handler.Warp.Date as D
 import qualified Network.Wai.Handler.Warp.FdCache as F
 import qualified Network.Wai.Handler.Warp.FileInfoCache as I
+import Network.Wai.Handler.Warp.HTTP1 (http1)
 import Network.Wai.Handler.Warp.HTTP2 (http2)
 import Network.Wai.Handler.Warp.HTTP2.Types (isHTTP2)
-import Network.Wai.Handler.Warp.Header
 import Network.Wai.Handler.Warp.Imports hiding (readInt)
-import Network.Wai.Handler.Warp.ReadInt
 import Network.Wai.Handler.Warp.Recv
-import Network.Wai.Handler.Warp.Request
-import Network.Wai.Handler.Warp.Response
 import Network.Wai.Handler.Warp.SendFile
 import Network.Wai.Handler.Warp.Settings
 import Network.Wai.Handler.Warp.Types
@@ -81,7 +72,7 @@ socketConnection _ s = do
             if tm == 0 then
                 close s
               else
-                gracefulClose s tm `E.catch` \(E.SomeException _) -> return ()
+                gracefulClose s tm `UnliftIO.catchAny` \(UnliftIO.SomeException _) -> return ()
 #else
       , connClose = close s
 #endif
@@ -93,11 +84,11 @@ socketConnection _ s = do
       , connHTTP2 = isH2
       }
   where
-    sendAll' sock bs = E.handleJust
+    sendAll' sock bs = UnliftIO.handleJust
       (\ e -> if ioeGetErrorType e == ResourceVanished
         then Just ConnectionClosedByPeer
         else Nothing)
-      throwIO
+      UnliftIO.throwIO
       $ Sock.sendAll sock bs
 
 -- | Run an 'Application' on the given port.
@@ -127,7 +118,7 @@ runEnv p app = do
 -- calls 'runSettingsSocket'.
 runSettings :: Settings -> Application -> IO ()
 runSettings set app = withSocketsDo $
-    bracket
+    UnliftIO.bracket
         (bindPortTCP (settingsPort set) (settingsHost set))
         close
         (\socket -> do
@@ -158,7 +149,7 @@ runSettingsSocket set socket app = do
 #endif
         setSocketCloseOnExec s
         -- NoDelay causes an error for AF_UNIX.
-        setSocketOption s NoDelay 1 `E.catch` \(E.SomeException _) -> return ()
+        setSocketOption s NoDelay 1 `UnliftIO.catchAny` \(UnliftIO.SomeException _) -> return ()
         conn <- socketConnection set s
         return (conn, sa)
 
@@ -219,7 +210,7 @@ withII set action =
     !timeoutInSeconds = settingsTimeout set * 1000000
     withTimeoutManager f = case settingsManager set of
         Just tm -> f tm
-        Nothing -> bracket
+        Nothing -> UnliftIO.bracket
                    (T.initialize timeoutInSeconds)
                    T.stopManager
                    f
@@ -248,8 +239,8 @@ acceptConnection set getConnMaker app counter ii = do
     -- ensure that no async exception is throw between the call to
     -- acceptNewConnection and the registering of connClose.
     --
-    -- acceptLoop can be broken by closing the listing socket.
-    void $ mask_ acceptLoop
+    -- acceptLoop can be broken by closing the listening socket.
+    void $ UnliftIO.mask_ acceptLoop
     -- In some cases, we want to stop Warp here without graceful shutdown.
     -- So, async exceptions are allowed here.
     -- That's why `finally` is not used.
@@ -274,7 +265,7 @@ acceptConnection set getConnMaker app counter ii = do
                 acceptLoop
 
     acceptNewConnection = do
-        ex <- try getConnMaker
+        ex <- UnliftIO.tryIO getConnMaker
         case ex of
             Right x -> return $ Just x
             Left e -> do
@@ -298,7 +289,12 @@ fork :: Settings
 fork set mkConn addr app counter ii = settingsFork set $ \unmask ->
     -- Call the user-supplied on exception code if any
     -- exceptions are thrown.
-    handle (settingsOnException set Nothing) $
+    --
+    -- Intentionally using Control.Exception.handle, since we want to
+    -- catch all exceptions and avoid them from propagating, even
+    -- async exceptions. See:
+    -- https://github.com/yesodweb/wai/issues/850
+    Control.Exception.handle (settingsOnException set Nothing) $
         -- Run the connection maker to get a new connection, and ensure
         -- that the connection is closed. If the mkConn call throws an
         -- exception, we will leak the connection. If the mkConn call is
@@ -309,20 +305,20 @@ fork set mkConn addr app counter ii = settingsFork set $ \unmask ->
         -- We grab the connection before registering timeouts since the
         -- timeouts will be useless during connection creation, due to the
         -- fact that async exceptions are still masked.
-        bracket mkConn cleanUp (serve unmask)
+        UnliftIO.bracket mkConn cleanUp (serve unmask)
   where
-    cleanUp (conn, _) = connClose conn `finally` connFree conn
+    cleanUp (conn, _) = connClose conn `UnliftIO.finally` connFree conn
 
     -- We need to register a timeout handler for this thread, and
     -- cancel that handler as soon as we exit.
-    serve unmask (conn, transport) = bracket register cancel $ \th -> do
+    serve unmask (conn, transport) = UnliftIO.bracket register cancel $ \th -> do
         -- We now have fully registered a connection close handler in
         -- the case of all exceptions, so it is safe to once again
         -- allow async exceptions.
         unmask .
             -- Call the user-supplied code for connection open and
             -- close events
-           bracket (onOpen addr) (onClose addr) $ \goingon ->
+           UnliftIO.bracket (onOpen addr) (onClose addr) $ \goingon ->
            -- Actually serve this connection.  bracket with closeConn
            -- above ensures the connection is closed.
            when goingon $ serveConnection conn ii th addr transport set app
@@ -351,235 +347,10 @@ serveConnection conn ii th origAddr transport settings app = do
                        return (True, bs0)
                      else
                        return (False, bs0)
-    istatus <- newIORef False
     if settingsHTTP2Enabled settings && h2 then do
-        rawRecvN <- makeReceiveN bs (connRecv conn) (connRecvBuf conn)
-        -- This thread becomes the sender in http2 library.
-        -- In the case of event source, one request comes and one
-        -- worker gets busy. But it is likely that the receiver does
-        -- not receive any data at all while the sender is sending
-        -- output data from the worker. It's not good enough to tickle
-        -- the time handler in the receiver only. So, we should tickle
-        -- the time handler in both the receiver and the sender.
-        let recvN = wrappedRecvN th istatus (settingsSlowlorisSize settings) rawRecvN
-            sendBS x = connSendAll conn x >> T.tickle th
-        -- fixme: origAddr
-        checkTLS
-        setConnHTTP2 conn True
-        http2 settings ii conn transport origAddr recvN sendBS app
+        http2 settings ii conn transport app origAddr th bs
       else do
-        src <- mkSource (wrappedRecv conn th istatus (settingsSlowlorisSize settings))
-        writeIORef istatus True
-        leftoverSource src bs
-        addr <- getProxyProtocolAddr src
-        http1 True addr istatus src `E.catch` \e ->
-          case () of
-            ()
-             -- See comment below referencing
-             -- https://github.com/yesodweb/wai/issues/618
-             | Just NoKeepAliveRequest <- fromException e -> return ()
-             -- No valid request
-             | Just (BadFirstLine _)   <- fromException e -> return ()
-             | otherwise -> do
-               _ <- sendErrorResponse (dummyreq addr) istatus e
-               throwIO e
-
-  where
-    getProxyProtocolAddr src =
-        case settingsProxyProtocol settings of
-            ProxyProtocolNone ->
-                return origAddr
-            ProxyProtocolRequired -> do
-                seg <- readSource src
-                parseProxyProtocolHeader src seg
-            ProxyProtocolOptional -> do
-                seg <- readSource src
-                if S.isPrefixOf "PROXY " seg
-                    then parseProxyProtocolHeader src seg
-                    else do leftoverSource src seg
-                            return origAddr
-
-    parseProxyProtocolHeader src seg = do
-        let (header,seg') = S.break (== 0x0d) seg -- 0x0d == CR
-            maybeAddr = case S.split 0x20 header of -- 0x20 == space
-                ["PROXY","TCP4",clientAddr,_,clientPort,_] ->
-                    case [x | (x, t) <- reads (decodeAscii clientAddr), null t] of
-                        [a] -> Just (SockAddrInet (readInt clientPort)
-                                                       (toHostAddress a))
-                        _ -> Nothing
-                ["PROXY","TCP6",clientAddr,_,clientPort,_] ->
-                    case [x | (x, t) <- reads (decodeAscii clientAddr), null t] of
-                        [a] -> Just (SockAddrInet6 (readInt clientPort)
-                                                        0
-                                                        (toHostAddress6 a)
-                                                        0)
-                        _ -> Nothing
-                ("PROXY":"UNKNOWN":_) ->
-                    Just origAddr
-                _ ->
-                    Nothing
-        case maybeAddr of
-            Nothing -> throwIO (BadProxyHeader (decodeAscii header))
-            Just a -> do leftoverSource src (S.drop 2 seg') -- drop CRLF
-                         return a
-
-    decodeAscii = map (chr . fromEnum) . S.unpack
-
-    shouldSendErrorResponse se
-        | Just ConnectionClosedByPeer <- fromException se = False
-        | otherwise                                       = True
-
-    sendErrorResponse req istatus e = do
-        status <- readIORef istatus
-        if shouldSendErrorResponse e && status
-            then do
-                sendResponse settings conn ii th req defaultIndexRequestHeader (return S.empty) (errorResponse e)
-            else return False
-
-    dummyreq addr = defaultRequest { remoteHost = addr }
-
-    errorResponse e = settingsOnExceptionResponse settings e
-
-    http1 firstRequest addr istatus src = do
-        (req, mremainingRef, idxhdr, nextBodyFlush) <- recvRequest firstRequest settings conn ii th addr src transport
-        keepAlive <- processRequest istatus src req mremainingRef idxhdr nextBodyFlush
-            `E.catch` \e -> do
-                settingsOnException settings (Just req) e
-                -- Don't throw the error again to prevent calling settingsOnException twice.
-                return False
-
-        -- When doing a keep-alive connection, the other side may just
-        -- close the connection. We don't want to treat that as an
-        -- exceptional situation, so we pass in False to http1 (which
-        -- in turn passes in False to recvRequest), indicating that
-        -- this is not the first request. If, when trying to read the
-        -- request headers, no data is available, recvRequest will
-        -- throw a NoKeepAliveRequest exception, which we catch here
-        -- and ignore. See: https://github.com/yesodweb/wai/issues/618
-        when keepAlive $ http1 False addr istatus src
-
-    processRequest istatus src req mremainingRef idxhdr nextBodyFlush = do
-        -- Let the application run for as long as it wants
-        T.pause th
-
-        -- In the event that some scarce resource was acquired during
-        -- creating the request, we need to make sure that we don't get
-        -- an async exception before calling the ResponseSource.
-        keepAliveRef <- newIORef $ error "keepAliveRef not filled"
-        r <- E.try $ app req $ \res -> do
-            T.resume th
-            -- FIXME consider forcing evaluation of the res here to
-            -- send more meaningful error messages to the user.
-            -- However, it may affect performance.
-            writeIORef istatus False
-            keepAlive <- sendResponse settings conn ii th req idxhdr (readSource src) res
-            writeIORef keepAliveRef keepAlive
-            return ResponseReceived
-        case r of
-            Right ResponseReceived -> return ()
-            Left e@(SomeException _)
-              | Just (ExceptionInsideResponseBody e') <- fromException e -> throwIO e'
-              | otherwise -> do
-                    keepAlive <- sendErrorResponse req istatus e
-                    settingsOnException settings (Just req) e
-                    writeIORef keepAliveRef keepAlive
-
-        keepAlive <- readIORef keepAliveRef
-
-        -- We just send a Response and it takes a time to
-        -- receive a Request again. If we immediately call recv,
-        -- it is likely to fail and cause the IO manager to do some work.
-        -- It is very costly, so we yield to another Haskell
-        -- thread hoping that the next Request will arrive
-        -- when this Haskell thread will be re-scheduled.
-        -- This improves performance at least when
-        -- the number of cores is small.
-        Conc.yield
-
-        if keepAlive
-          then
-            -- If there is an unknown or large amount of data to still be read
-            -- from the request body, simple drop this connection instead of
-            -- reading it all in to satisfy a keep-alive request.
-            case settingsMaximumBodyFlush settings of
-                Nothing -> do
-                    flushEntireBody nextBodyFlush
-                    T.resume th
-                    return True
-                Just maxToRead -> do
-                    let tryKeepAlive = do
-                            -- flush the rest of the request body
-                            isComplete <- flushBody nextBodyFlush maxToRead
-                            if isComplete then do
-                                T.resume th
-                                return True
-                              else
-                                return False
-                    case mremainingRef of
-                        Just ref -> do
-                            remaining <- readIORef ref
-                            if remaining <= maxToRead then
-                                tryKeepAlive
-                              else
-                                return False
-                        Nothing -> tryKeepAlive
-          else
-            return False
-
-    checkTLS = case transport of
-        TCP -> return () -- direct
-
--- connClose must not be called here since Run:fork calls it
-goaway :: Connection -> H2.ErrorCodeId -> ByteString -> IO ()
-goaway Connection{..} etype debugmsg = connSendAll bytestream
-  where
-    einfo = H2.encodeInfo id 0
-    frame = H2.GoAwayFrame 0 etype debugmsg
-    bytestream = H2.encodeFrame einfo frame
-
-flushEntireBody :: IO ByteString -> IO ()
-flushEntireBody src =
-    loop
-  where
-    loop = do
-        bs <- src
-        unless (S.null bs) loop
-
-flushBody :: IO ByteString -- ^ get next chunk
-          -> Int -- ^ maximum to flush
-          -> IO Bool -- ^ True == flushed the entire body, False == we didn't
-flushBody src =
-    loop
-  where
-    loop toRead = do
-        bs <- src
-        let toRead' = toRead - S.length bs
-        case () of
-            ()
-                | S.null bs -> return True
-                | toRead' >= 0 -> loop toRead'
-                | otherwise -> return False
-
-wrappedRecv :: Connection -> T.Handle -> IORef Bool -> Int -> IO ByteString
-wrappedRecv Connection { connRecv = recv } th istatus slowlorisSize = do
-    bs <- recv
-    unless (S.null bs) $ do
-        writeIORef istatus True
-        when (S.length bs >= slowlorisSize) $ T.tickle th
-    return bs
-
-wrappedRecvN :: T.Handle -> IORef Bool -> Int -> (BufSize -> IO ByteString) -> (BufSize -> IO ByteString)
-wrappedRecvN th istatus slowlorisSize readN bufsize = do
-    bs <- readN bufsize
-    unless (S.null bs) $ do
-        writeIORef istatus True
-    -- TODO: think about the slowloris protection in HTTP2: current code
-    -- might open a slow-loris attack vector. Rather than timing we should
-    -- consider limiting the per-client connections assuming that in HTTP2
-    -- we should allow only few connections per host (real-world
-    -- deployments with large NATs may be trickier).
-        when (S.length bs >= slowlorisSize || bufsize <= slowlorisSize) $ T.tickle th
-    return bs
+        http1 settings ii conn transport app origAddr th bs
 
 -- | Set flag FileCloseOnExec flag on a socket (on Unix)
 --

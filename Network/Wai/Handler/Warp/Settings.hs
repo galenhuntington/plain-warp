@@ -1,21 +1,23 @@
 {-# LANGUAGE OverloadedStrings, ScopedTypeVariables, ViewPatterns #-}
 {-# LANGUAGE PatternGuards, RankNTypes #-}
 {-# LANGUAGE ImpredicativeTypes, CPP #-}
+{-# LANGUAGE MagicHash, UnboxedTuples #-}
 
 module Network.Wai.Handler.Warp.Settings where
 
-import Control.Concurrent (forkIOWithUnmask)
-import Control.Exception
-import Data.ByteString.Builder (byteString)
+import GHC.IO (unsafeUnmask, IO (IO))
+import GHC.Prim (fork#)
+import UnliftIO (SomeException, fromException)
 import qualified Data.ByteString.Char8 as C8
+import qualified Data.ByteString.Builder as Builder
 import Data.ByteString.Lazy (fromStrict)
 import Data.Streaming.Network (HostPreference)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
 import Data.Version (showVersion)
-import GHC.IO.Exception (IOErrorType(..))
+import GHC.IO.Exception (IOErrorType(..), AsyncException (ThreadKilled))
 import qualified Network.HTTP.Types as H
-import Network.HTTP2( HTTP2Error (..), ErrorCodeId (..) )
+import Network.HTTP2.Frame (HTTP2Error (..), ErrorCodeId (..))
 import Network.Socket (SockAddr)
 import Network.Wai
 import qualified Paths_plain_warp as Paths
@@ -63,7 +65,7 @@ data Settings = Settings
       -- This may be useful if you need OS bound threads, or if
       -- you wish to develop an alternative threading model.
       --
-      -- Default: void . forkIOWithUnmask
+      -- Default: 'defaultFork'
       --
       -- Since 3.0.4
 
@@ -163,7 +165,7 @@ defaultSettings = Settings
     , settingsFdCacheDuration = 0
     , settingsFileInfoCacheDuration = 0
     , settingsBeforeMainLoop = return ()
-    , settingsFork = void . forkIOWithUnmask
+    , settingsFork = defaultFork
     , settingsNoParsePath = False
     , settingsInstallShutdownHandler = const $ return ()
     , settingsServerName = C8.pack $ "Warp/" ++ showVersion Paths.version
@@ -235,4 +237,19 @@ exceptionResponseForDebug :: SomeException -> Response
 exceptionResponseForDebug e =
     responseBuilder H.internalServerError500
                     [(H.hContentType, "text/plain; charset=utf-8")]
-                    $ byteString . C8.pack $ "Exception: " ++ show e
+                    $ "Exception: " <> Builder.stringUtf8 (show e)
+
+-- | Similar to @forkIOWithUnmask@, but does not set up the default exception handler.
+--
+-- Since Warp will always install its own exception handler in forked threads, this provides
+-- a minor optimization.
+--
+-- For inspiration of this function, see @rawForkIO@ in the @async@ package.
+--
+-- @since 3.3.17
+defaultFork :: ((forall a. IO a -> IO a) -> IO ()) -> IO ()
+defaultFork io =
+  IO $ \s0 ->
+    case (fork# (io unsafeUnmask) s0) of
+      (# s1, _tid #) ->
+        (# s1, () #)
